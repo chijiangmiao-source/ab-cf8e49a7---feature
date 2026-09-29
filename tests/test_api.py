@@ -87,6 +87,67 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(body["verdict"], "error")
         self.assertNotIn("points", body)
 
+    def test_recheck_terminating(self):
+        code, body = self._post("/recheck", {
+            "num_registers": 1,
+            "initial": [{"lo": 0, "hi": 5}],
+            "instructions": [
+                {"id": 0, "op": "branch",
+                 "cond": {"coefs": {"0": 1}, "op": "<=", "value": 0}, "target": 3},
+                {"id": 1, "op": "add", "reg": 0, "value": -1},
+                {"id": 2, "op": "goto", "target": 0},
+                {"id": 3, "op": "halt"},
+            ],
+        })
+        self.assertEqual(code, 200)
+        self.assertEqual(body["verdict"], "terminating")
+        self.assertEqual(body["loops"]["proven"], 1)
+        cert = body["certificates"][0]
+        self.assertEqual(cert["ranking_register"], 0)
+        self.assertEqual(cert["ranking_lower_bounds"], {"0": 0, "1": 1, "2": 0})
+
+    def test_recheck_cannot_prove_unbounded_loop(self):
+        code, body = self._post("/recheck", {
+            "num_registers": 2,
+            "initial": [{"lo": 0, "hi": 0}, {"lo": 0, "hi": 0}],
+            "instructions": [
+                {"id": 0, "op": "branch",
+                 "cond": {"coefs": {"1": 1}, "op": "==", "value": 1}, "target": 4},
+                {"id": 1, "op": "add", "reg": 0, "value": 1},
+                {"id": 2, "op": "set", "reg": 1, "value": 0},
+                {"id": 3, "op": "goto", "target": 0},
+                {"id": 4, "op": "halt"},
+            ],
+        })
+        self.assertEqual(code, 200)
+        self.assertEqual(body["verdict"], "cannot_prove")
+        self.assertEqual(body["first_unproven_loop"]["kind"],
+                         "termination_proof_failure")
+
+    def test_recheck_requires_passed_audit(self):
+        code, body = self._post("/recheck", {
+            "num_registers": 1,
+            "initial": [{"lo": 0, "hi": 0}],
+            "instructions": [
+                {"id": 0, "op": "assert",
+                 "cond": {"coefs": {"0": 1}, "op": "<=", "value": -1}},
+                {"id": 1, "op": "halt"},
+            ],
+        })
+        self.assertEqual(code, 200)
+        self.assertEqual(body["verdict"], "error")
+        self.assertEqual(body["reason"], "envelope_audit_not_passed")
+
+    def test_recheck_structural_error_no_evidence(self):
+        code, body = self._post("/recheck", {
+            "num_registers": 1,
+            "initial": [{"lo": 0, "hi": 0}],
+            "instructions": [{"id": 0, "op": "goto", "target": 0}],
+        })
+        self.assertEqual(code, 200)
+        self.assertEqual(body["verdict"], "error")
+        self.assertNotIn("certificates", body)
+
     def test_bad_json(self):
         code, body = self._post("/audit", raw=b"{not json")
         self.assertEqual(code, 400)

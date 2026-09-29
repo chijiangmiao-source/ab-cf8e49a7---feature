@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from . import __version__
 from .analyzer import analyze
+from .termination import analyze_termination
 
 MAX_BODY = 1 << 20  # 1 MiB
 SERVICE_NAME = "octagon-auditor"
@@ -46,6 +47,7 @@ class Handler(BaseHTTPRequestHandler):
                 "endpoints": {
                     "GET /health": "健康检查",
                     "POST /audit": "提交保护脚本(num_registers/initial/instructions),返回审计结论",
+                    "POST /recheck": "对已通过包线审计的同一脚本发起终止性复核,返回循环证书",
                 },
             })
         else:
@@ -53,7 +55,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
-        if path != "/audit":
+        if path not in ("/audit", "/recheck"):
             self._json(404, {"error": "not_found", "path": path})
             return
         try:
@@ -73,7 +75,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "bad_request", "detail": "top level must be a JSON object"})
             return
         try:
-            result = analyze(payload)
+            if path == "/recheck":
+                result = analyze_termination(payload)
+            else:
+                result = analyze(payload)
         except Exception:  # 防御:内部异常不泄漏堆栈,也绝不放行
             traceback.print_exc()
             self._json(500, {"verdict": "error", "reason": "internal_error"})

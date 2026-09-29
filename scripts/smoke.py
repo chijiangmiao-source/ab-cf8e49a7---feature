@@ -64,6 +64,67 @@ ERROR_CASE = {
     ],
 }
 
+# 终止性复核 1:单调计数循环(每轮 -1,不变量下界 0)→ terminating
+RECHECK_DECREASING = {
+    "num_registers": 1,
+    "initial": [{"lo": 0, "hi": 5}],
+    "instructions": [
+        {"id": 0, "op": "branch",
+         "cond": {"coefs": {"0": 1}, "op": "<=", "value": 0}, "target": 3},
+        {"id": 1, "op": "add", "reg": 0, "value": -1},
+        {"id": 2, "op": "goto", "target": 0},
+        {"id": 3, "op": "halt"},
+    ],
+}
+
+# 终止性复核 2:分支交替仍终止——两条回程分别 -1 / -2,闭包后任意回程都严格降
+RECHECK_ALTERNATING = {
+    "num_registers": 2,
+    "initial": [{"lo": 0, "hi": 5}, {"lo": 0, "hi": 0}],
+    "instructions": [
+        {"id": 0, "op": "branch",
+         "cond": {"coefs": {"0": 1}, "op": "<=", "value": 0}, "target": 6},
+        {"id": 1, "op": "branch",
+         "cond": {"coefs": {"1": 1}, "op": "==", "value": 0}, "target": 4},
+        {"id": 2, "op": "add", "reg": 0, "value": -1},
+        {"id": 3, "op": "goto", "target": 5},
+        {"id": 4, "op": "add", "reg": 0, "value": -2},
+        {"id": 5, "op": "goto", "target": 0},
+        {"id": 6, "op": "halt"},
+    ],
+}
+
+# 终止性复核 2b(对照):一升一降交替,局部下降被抵消 → cannot_prove,不伪称死循环
+RECHECK_FAKE_PROGRESS = {
+    "num_registers": 2,
+    "initial": [{"lo": 0, "hi": 5}, {"lo": 0, "hi": 0}],
+    "instructions": [
+        {"id": 0, "op": "branch",
+         "cond": {"coefs": {"0": 1}, "op": "<=", "value": 0}, "target": 6},
+        {"id": 1, "op": "branch",
+         "cond": {"coefs": {"1": 1}, "op": "==", "value": 0}, "target": 4},
+        {"id": 2, "op": "add", "reg": 0, "value": -1},
+        {"id": 3, "op": "goto", "target": 5},
+        {"id": 4, "op": "add", "reg": 0, "value": 1},
+        {"id": 5, "op": "goto", "target": 0},
+        {"id": 6, "op": "halt"},
+    ],
+}
+
+# 终止性复核 3:无界自增闭环(x0 每轮 +1,循环不变量无有限上界)→ cannot_prove
+RECHECK_UNBOUNDED_UP = {
+    "num_registers": 2,
+    "initial": [{"lo": 0, "hi": 0}, {"lo": 0, "hi": 0}],
+    "instructions": [
+        {"id": 0, "op": "branch",
+         "cond": {"coefs": {"1": 1}, "op": "==", "value": 1}, "target": 4},
+        {"id": 1, "op": "add", "reg": 0, "value": 1},
+        {"id": 2, "op": "set", "reg": 1, "value": 0},
+        {"id": 3, "op": "goto", "target": 0},
+        {"id": 4, "op": "halt"},
+    ],
+}
+
 _failures = []
 
 
@@ -143,6 +204,78 @@ def main():
     code, body = request("POST", "/audit", PASS_CASE)
     check("no stale state after error case",
           code == 200 and body.get("verdict") == "pass")
+
+    # ------------------------------------------------------------------
+    # 终止性复核 POST /recheck:四类验收场景
+    # ------------------------------------------------------------------
+    code, body = request("POST", "/recheck", RECHECK_DECREASING)
+    check("recheck monotone counting loop terminates",
+          code == 200 and body.get("verdict") == "terminating",
+          f"code={code} body={body}")
+    check("recheck certificate replayable (rank/direction/bounds)",
+          bool(body.get("certificates")) and
+          body["certificates"][0].get("ranking_register") == 0 and
+          body["certificates"][0].get("ranking_direction") == "decreasing" and
+          body["certificates"][0].get("ranking_lower_bounds") ==
+          {"0": 0, "1": 1, "2": 0})
+    check("recheck certificate lists closed cycle relations",
+          all(rels.get("0") == "<"
+              for rels in body["certificates"][0]["closed_cycle_relations"].values())
+          if body.get("certificates") else False)
+
+    code, body = request("POST", "/recheck", RECHECK_ALTERNATING)
+    check("recheck alternating branches still terminate",
+          code == 200 and body.get("verdict") == "terminating",
+          f"code={code} body={body}")
+    check("recheck closure joins per-path relations",
+          bool(body.get("certificates")) and
+          all(rels.get("0") == "<"
+              for rels in body["certificates"][0]["closed_cycle_relations"].values()))
+
+    code, body = request("POST", "/recheck", RECHECK_FAKE_PROGRESS)
+    check("recheck fake alternating progress cannot be proven",
+          code == 200 and body.get("verdict") == "cannot_prove",
+          f"code={code} body={body}")
+    check("recheck does not fabricate infinite loop",
+          body.get("first_unproven_loop", {}).get("kind") ==
+          "termination_proof_failure" and
+          "并非断言存在实际死循环" in
+          body.get("first_unproven_loop", {}).get("note", ""))
+    check("recheck failure names missing decrease at stable head",
+          body.get("first_unproven_loop", {}).get("loop_head") == 0 and
+          any(m.get("kind") == "strict_decrease"
+              for c in body.get("first_unproven_loop", {})
+              .get("register_candidates", [])
+              for m in c.get("missing", [])))
+
+    code, body = request("POST", "/recheck", RECHECK_UNBOUNDED_UP)
+    check("recheck unbounded self-increment loop cannot be proven",
+          code == 200 and body.get("verdict") == "cannot_prove",
+          f"code={code} body={body}")
+    check("recheck names missing upper bound",
+          any(m.get("kind") == "upper_bound"
+              for c in body.get("first_unproven_loop", {})
+              .get("register_candidates", [])
+              for m in c.get("missing", [])))
+
+    # 审计门禁:包线未过的脚本不接受复核
+    code, body = request("POST", "/recheck", FAIL_CASE)
+    check("recheck gated on passed envelope audit",
+          code == 200 and body.get("verdict") == "error" and
+          body.get("reason") == "envelope_audit_not_passed" and
+          body.get("first_unproven_point") == 2)
+
+    # 结构错误:合并反馈,不携带循环证书等旧结论
+    code, body = request("POST", "/recheck", ERROR_CASE)
+    check("recheck structural errors merged without certificates",
+          code == 200 and body.get("verdict") == "error" and
+          "certificates" not in body and "loops" not in body)
+
+    # 复核不改变 /audit 的无状态结论(原审计回归)
+    code, body = request("POST", "/audit", PASS_CASE)
+    check("audit regression after rechecks",
+          code == 200 and body.get("verdict") == "pass" and
+          "certificates" not in body)
 
     if _failures:
         print(f"smoke FAILED: {len(_failures)} check(s): {', '.join(_failures)}")

@@ -214,24 +214,13 @@ def _points_view(engine: _Engine) -> dict:
     return out
 
 
-def analyze(payload) -> dict:
-    """审计入口:返回 pass / fail / error 三种结论之一。"""
-    prog, errors = parse_program(payload)
-    if errors:
-        # 结构问题合并反馈;不附带任何(旧)分析证据
-        return {"verdict": "error", "reason": "structural_errors", "errors": errors}
-
-    engine = _Engine(prog)
-    violations = engine.run()
-    if violations:  # 理论上不发生;宁可报错也不放行
-        return {"verdict": "error", "reason": "fixpoint_verification_failed",
-                "violations": violations}
-
+def _assertion_view(prog, inv) -> tuple:
+    """逐断言裁决,返回 (assertions 响应列表, 未证条目 (point, cond, state, details))。"""
     assertions = []
     unproven = []
     for point in sorted(prog.asserts):
         cond = prog.asserts[point]
-        state = engine.inv[point]
+        state = inv[point]
         if state is None:
             assertions.append({"point": point, "condition": cond.text, "status": "unreachable"})
             continue
@@ -244,6 +233,46 @@ def analyze(payload) -> dict:
         })
         if not ok:
             unproven.append((point, cond, state, details))
+    return assertions, unproven
+
+
+def prepare_analysis(payload) -> dict:
+    """共享分析流水线:/audit 包线审计与 /recheck 终止性复核复用同一套
+
+    结构校验 → 上升/下降不动点 → 终态校验 → 断言裁决的结果,
+    保证两个端点对"同一份保护脚本"看到完全相同的程序结构与八边形不变量。
+
+    返回:
+      {"outcome": "error", "response": <完整错误响应>}
+      {"outcome": "ok", "prog", "engine", "assertions", "unproven"}
+    """
+    prog, errors = parse_program(payload)
+    if errors:
+        # 结构问题合并反馈;不附带任何(旧)分析证据
+        return {"outcome": "error",
+                "response": {"verdict": "error", "reason": "structural_errors", "errors": errors}}
+
+    engine = _Engine(prog)
+    violations = engine.run()
+    if violations:  # 理论上不发生;宁可报错也不放行
+        return {"outcome": "error",
+                "response": {"verdict": "error", "reason": "fixpoint_verification_failed",
+                             "violations": violations}}
+
+    assertions, unproven = _assertion_view(prog, engine.inv)
+    return {"outcome": "ok", "prog": prog, "engine": engine,
+            "assertions": assertions, "unproven": unproven}
+
+
+def analyze(payload) -> dict:
+    """审计入口:返回 pass / fail / error 三种结论之一。"""
+    prep = prepare_analysis(payload)
+    if prep["outcome"] == "error":
+        return prep["response"]
+    prog = prep["prog"]
+    engine = prep["engine"]
+    assertions = prep["assertions"]
+    unproven = prep["unproven"]
 
     response = {
         "verdict": "pass" if not unproven else "fail",
