@@ -214,18 +214,23 @@ def _points_view(engine: _Engine) -> dict:
     return out
 
 
-def analyze(payload) -> dict:
-    """审计入口:返回 pass / fail / error 三种结论之一。"""
+def analyze_components(payload):
+    """运行结构校验与不动点分析,供 /audit 与终止性复核复用同一份证据。
+
+    返回 (kind, data):
+      ("error", response)            结构错误或不动点校验失败
+      ("ok", (prog, engine, result)) result 含 assertions/unproven 等审计中间量
+    """
     prog, errors = parse_program(payload)
     if errors:
         # 结构问题合并反馈;不附带任何(旧)分析证据
-        return {"verdict": "error", "reason": "structural_errors", "errors": errors}
+        return "error", {"verdict": "error", "reason": "structural_errors", "errors": errors}
 
     engine = _Engine(prog)
     violations = engine.run()
     if violations:  # 理论上不发生;宁可报错也不放行
-        return {"verdict": "error", "reason": "fixpoint_verification_failed",
-                "violations": violations}
+        return "error", {"verdict": "error", "reason": "fixpoint_verification_failed",
+                         "violations": violations}
 
     assertions = []
     unproven = []
@@ -244,6 +249,17 @@ def analyze(payload) -> dict:
         })
         if not ok:
             unproven.append((point, cond, state, details))
+    return "ok", (prog, engine, {"assertions": assertions, "unproven": unproven})
+
+
+def analyze(payload) -> dict:
+    """审计入口:返回 pass / fail / error 三种结论之一。"""
+    kind, data = analyze_components(payload)
+    if kind == "error":
+        return data
+    prog, engine, audit = data
+    unproven = audit["unproven"]
+    assertions = audit["assertions"]
 
     response = {
         "verdict": "pass" if not unproven else "fail",

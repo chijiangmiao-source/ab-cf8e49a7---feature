@@ -87,6 +87,81 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(body["verdict"], "error")
         self.assertNotIn("points", body)
 
+    # ------------------------------------------------------------------
+    # 终止性复核 POST /terminate
+    # ------------------------------------------------------------------
+    def _down_counter(self):
+        return {
+            "num_registers": 1,
+            "initial": [{"lo": 3, "hi": 3}],
+            "instructions": [
+                {"id": 0, "op": "branch",
+                 "cond": {"coefs": {"0": 1}, "op": ">", "value": 0}, "target": 3},
+                {"id": 1, "op": "assert",
+                 "cond": {"coefs": {"0": 1}, "op": ">=", "value": 0}},
+                {"id": 2, "op": "halt"},
+                {"id": 3, "op": "add", "reg": 0, "value": -1},
+                {"id": 4, "op": "goto", "target": 0},
+            ],
+        }
+
+    def test_terminate_monotone_counter(self):
+        code, body = self._post("/terminate", self._down_counter())
+        self.assertEqual(code, 200)
+        self.assertEqual(body["verdict"], "terminating")
+        self.assertEqual(body["envelope"]["verdict"], "pass")
+        self.assertTrue(body["reachable_graph"]["exit_reachable"])
+        cert = body["loop_certificates"][0]
+        self.assertEqual(cert["status"], "proven")
+        self.assertTrue(cert["closure"]["every_repeatable_walk_decreases"])
+
+    def test_terminate_unknown_unbounded_loop(self):
+        code, body = self._post("/terminate", {
+            "num_registers": 1,
+            "initial": [{"lo": 0, "hi": 0}],
+            "instructions": [
+                {"id": 0, "op": "add", "reg": 0, "value": 1},
+                {"id": 1, "op": "branch",
+                 "cond": {"coefs": {"0": 1}, "op": "<", "value": 0}, "target": 3},
+                {"id": 2, "op": "goto", "target": 0},
+                {"id": 3, "op": "halt"},
+            ],
+        })
+        self.assertEqual(code, 200)
+        self.assertEqual(body["verdict"], "unknown")
+        self.assertEqual(body["first_unproven_cycle"]["kind"],
+                         "no_ranking_witness")
+        self.assertIn("并非已构造出实际死循环",
+                      body["first_unproven_cycle"]["note"])
+
+    def test_terminate_structural_error_has_no_stale_evidence(self):
+        code, body = self._post("/terminate", {
+            "num_registers": 1,
+            "initial": [{"lo": 0, "hi": 0}],
+            "instructions": [{"id": 0, "op": "goto", "target": 0}],
+        })
+        self.assertEqual(code, 200)
+        self.assertEqual(body["verdict"], "error")
+        self.assertEqual([e["kind"] for e in body["errors"]],
+                         ["no_reachable_halt"])
+        self.assertNotIn("points", body)
+        self.assertNotIn("loop_certificates", body)
+
+    def test_terminate_bad_json_and_not_found(self):
+        code, _ = self._post("/terminate", raw=b"{not json")
+        self.assertEqual(code, 400)
+        code, _ = self._post("/other", {})
+        self.assertEqual(code, 404)
+
+    def test_audit_format_unchanged_by_terminate(self):
+        """新增 /terminate 后,/audit 的结论与字段形态保持原样。"""
+        code, body = self._post("/audit", self._down_counter())
+        self.assertEqual(code, 200)
+        self.assertEqual(body["verdict"], "pass")
+        self.assertNotIn("loop_certificates", body)
+        self.assertNotIn("envelope", body)
+        self.assertIn("fixpoint", body)
+
     def test_bad_json(self):
         code, body = self._post("/audit", raw=b"{not json")
         self.assertEqual(code, 400)

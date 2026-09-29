@@ -2,11 +2,13 @@
 
 对姿态执行器保护脚本做**八边形抽象域**上的静态验证:上传前必须证明每次点火、
 转向或增压指令(以包线断言建模)在所有可达程序点上都被不变量蕴含,绝不因有限
-回放恰好未触发危险分支而放行。服务零第三方依赖,仅使用 Python 标准库。
+回放恰好未触发危险分支而放行。包线审计通过后,工程师还可对**同一份脚本**发起
+终止性复核(`POST /terminate`),确认任一可达控制路径都到达 halt 或顺序终止。
+服务零第三方依赖,仅使用 Python 标准库。
 
 ## 输入模型
 
-`POST /audit` 接收 JSON:
+`POST /audit` 与 `POST /terminate` 接收同一 JSON:
 
 ```json
 {
@@ -62,6 +64,45 @@
 已知精度边界:`!=` 的真方向与 `==` 的假方向不是八边形约束,按恒等(不收窄)
 处理,保持可靠但可能产生抽象告警。
 
+## 终止性复核(`POST /terminate`)
+
+包线审计通过后可对同一脚本发起**终止性复核**:不是看到存在一个可达终止点就
+放行,而是确认**每条可达控制路径**最终到达 halt 或顺序终止。复核复用同一份
+已验证程序结构与八边形后不动量(同一次请求内独立重算,不依赖任何历史状态)。
+
+- **可行可达子图**:以后不动点迁移非空的边为可行边(被不变量判空的分支不可
+  执行),从程序点 0 出发求可达点;`reachable_graph` 给出节点、可行边与
+  `exit_reachable`,可独立重放。
+- **逐转移寄存器关系**:对每条可行边、每个寄存器推导两个方向的关系——
+  下降方向的非增 `x' <= x` / 严格下降 `x' < x`,上升方向的非降 / 严格上升
+  (`add` 按常数判定;`set` 以源点不变量的下/上界判定,无界则关系未知,
+  不臆造),全部列于循环证书的 `transitions[].register_relations`。
+- **SCC 闭路闭包**:对可达子图求强连通区,在每个非平凡 SCC(唯一可能无限
+  重复的区域)内闭包这些关系——对任意可重复有向闭路,必须存在同一方向原子
+  (寄存器 + 下降/上升),使闭路每条边对其非增/非降、至少一条边严格变化、
+  且该严格步源点的不变量给出相应界(下降需下界、上升需上界;非增序列在每圈
+  固定位置有界即整体有界)。这样**分支交替时某支上的局部下降不会被误作全局
+  进展**。判定在有限扩展图 `(程序点, 仍单调原子集 I, 已出现受界严格步原子
+  集 O)` 上做可达搜索,掩码沿边做 I∧R、O∨G;不存在回到起点且 `I & O = 0`
+  的闭路才放行。
+
+### 复核结论形态
+
+- **`terminating`**:无非平凡 SCC,或每个非平凡 SCC 都通过闭路闭包判据。
+  `loop_certificates[]` 给出**可独立重放的循环证书**:SCC 程序点、逐点界
+  (`bounds`)、逐转移寄存器关系(`transitions`)、严格步见证(`ranking_edges`)
+  与闭包方法说明(`closure`),调用方仅凭响应即可重验同一条结论。
+- **`unknown`**:存在无法赋排序见证的可重复闭路。`first_unproven_cycle` 按
+  稳定程序点(最小编号锚点、BFS 最短闭路)给出闭路、**首个无法证明的循环
+  关系**(`first_cycle_relation`)以及逐寄存器方向缺失的是
+  `monotone_relation` / `strict_step` / `lower_bound` / `upper_bound`
+  (`register_evidence[].missing`)。`kind: "no_ranking_witness"` 与 `note`
+  明示这是八边形证明力不足,**并非实际死循环**,禁止据此判定脚本必然无限执行。
+- **`error`**:结构错误,形态与 `/audit` 完全一致(合并反馈、不携带旧结论)。
+
+`envelope` 字段为同一次复核中独立复算的包线结论(供对照);`/audit` 的结论
+与响应格式保持不变,`POST /terminate` 不修改、不依赖任何既往请求的结果。
+
 ## 运行
 
 ```bash
@@ -69,12 +110,14 @@
 PORT=8080 python -m app.server
 curl localhost:8080/health
 curl -X POST localhost:8080/audit -d @script.json
+curl -X POST localhost:8080/terminate -d @script.json
 
 # Compose(宿主机端口可配置,默认 8080)
 AUDIT_HOST_PORT=9090 docker compose up --build app
 ```
 
-接口:`GET /health`(健康路径)、`GET /`(服务信息)、`POST /audit`(审计接口)。
+接口:`GET /health`(健康路径)、`GET /`(服务信息)、`POST /audit`(包线审计)、
+`POST /terminate`(终止性复核)。
 容器内端口由 `PORT` 配置,宿主机映射由 `AUDIT_HOST_PORT` 配置。
 
 ## 验证(verify 容器)
@@ -85,24 +128,27 @@ docker compose up --build --exit-code-from verify --abort-on-container-exit veri
 
 `verify` 容器依次执行并以退出状态码报告结果(0 通过 / 1 失败):
 
-1. **代码测试**:`python -m unittest discover -s tests -t .`(35 个用例,
-   覆盖八边形域、分析器与 HTTP 接口);
+1. **代码测试**:`python -m unittest discover -s tests -t .`(51 个用例,
+   覆盖八边形域、分析器、终止性复核与 HTTP 接口);
 2. **镜像构建检查**:`verify` 阶段 `FROM app` 阶段构建,构建 verify 即复核
    app 镜像可构建;冒烟时再将 `/health` 返回的版本与 `EXPECTED_VERSION` 比对,
    确认运行中的镜像即期望构建;
-3. **HTTP 冒烟**(`scripts/smoke.py`):等待健康路径就绪后,核对放行用例
+3. **HTTP 冒烟**(`scripts/smoke.py`):等待健康路径就绪后,核对包线放行用例
    (含循环关系不变量)、未证告警用例(首个未证点、抽象边界、未涵盖条件)、
-   结构错误合并反馈用例(四类错误齐备且无旧证据),并复测无状态性。
+   结构错误合并反馈用例(四类错误齐备且无旧证据);终止性复核覆盖**单调计数
+   循环、分支交替仍终止的循环、无界自增闭环**(按稳定程序点说明缺失的界且
+   不伪造死循环)与结构错误合并反馈,并复测无状态性与**原 /audit 回归**。
 
 ## 目录结构
 
 ```
-app/octagon.py    八边形域:DBM、强闭包、迁移函数、格运算、规范化约束输出
-app/program.py    指令解析、结构校验(合并反馈)、控制流图、widening 点
-app/analyzer.py   上升/下降不动点引擎、终态校验、断言蕴含判定
-app/server.py     HTTP 服务:GET /health,POST /audit
-tests/            单元测试(unittest,零依赖)
-scripts/smoke.py  verify 容器的 HTTP 冒烟
-Dockerfile        多阶段:app(运行)/ verify(验证)
+app/octagon.py     八边形域:DBM、强闭包、迁移函数、格运算、规范化约束输出
+app/program.py     指令解析、结构校验(合并反馈)、控制流图、widening 点
+app/analyzer.py    上升/下降不动点引擎、终态校验、断言蕴含判定、共享分析入口
+app/termination.py 终止性复核:可行可达子图、SCC、逐转移关系、闭路闭包与循环证书
+app/server.py      HTTP 服务:GET /health,POST /audit,POST /terminate
+tests/             单元测试(unittest,零依赖)
+scripts/smoke.py   verify 容器的 HTTP 冒烟
+Dockerfile         多阶段:app(运行)/ verify(验证)
 docker-compose.yml app 服务(可配置宿主机端口)+ verify 容器
 ```

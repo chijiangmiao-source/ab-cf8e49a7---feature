@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from . import __version__
 from .analyzer import analyze
+from .termination import review_termination
 
 MAX_BODY = 1 << 20  # 1 MiB
 SERVICE_NAME = "octagon-auditor"
@@ -45,35 +46,51 @@ class Handler(BaseHTTPRequestHandler):
                 "version": _version(),
                 "endpoints": {
                     "GET /health": "健康检查",
-                    "POST /audit": "提交保护脚本(num_registers/initial/instructions),返回审计结论",
+                    "POST /audit": "提交保护脚本(num_registers/initial/instructions),返回包线审计结论",
+                    "POST /terminate": "对同一脚本发起终止性复核(复用结构与八边形不变量),"
+                                       "返回 terminating/unknown/error 与循环证书",
                 },
             })
         else:
             self._json(404, {"error": "not_found", "path": path})
 
-    def do_POST(self) -> None:
-        path = urlsplit(self.path).path
-        if path != "/audit":
-            self._json(404, {"error": "not_found", "path": path})
-            return
+    def _read_payload(self):
+        """读取并解析 JSON 请求体;成功返回 (payload, None),否则写回错误响应并返回 (None, True)。"""
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = 0
         if length <= 0 or length > MAX_BODY:
             self._json(400, {"error": "bad_request", "detail": "missing or oversized body"})
-            return
+            return None, True
         raw = self.rfile.read(length)
         try:
             payload = json.loads(raw)
         except (ValueError, UnicodeDecodeError):
             self._json(400, {"error": "bad_request", "detail": "body is not valid JSON"})
-            return
+            return None, True
         if not isinstance(payload, dict):
             self._json(400, {"error": "bad_request", "detail": "top level must be a JSON object"})
+            return None, True
+        return payload, False
+
+    def do_POST(self) -> None:
+        path = urlsplit(self.path).path
+        if path == "/audit":
+            payload, errored = self._read_payload()
+            if errored:
+                return
+            handler = analyze
+        elif path == "/terminate":
+            payload, errored = self._read_payload()
+            if errored:
+                return
+            handler = review_termination
+        else:
+            self._json(404, {"error": "not_found", "path": path})
             return
         try:
-            result = analyze(payload)
+            result = handler(payload)
         except Exception:  # 防御:内部异常不泄漏堆栈,也绝不放行
             traceback.print_exc()
             self._json(500, {"verdict": "error", "reason": "internal_error"})

@@ -54,7 +54,7 @@ class Instr:
     target: "int | None" = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class Edge:
     src: object
     dst: object
